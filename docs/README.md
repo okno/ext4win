@@ -1,4 +1,7 @@
 # Ext4Win
+![Ext4Win Logo](https://github.com/okno/ext4win/blob/main/banner.png)
+
+*Mount Ext4 in R/w Partition on Windows 10/11*
 
 Ext4Win è un piccolo tool per **Windows 10/11** che ti permette di montare partizioni **ext4** (dischi fisici/USB/VHD) dentro **WSL2** usando `wsl.exe --mount`, mantenere il mount “vivo” (keepalive) e accedere ai file da Esplora file tramite `\\wsl.localhost\<Distro>\...`.
 

@@ -75,4 +75,7 @@ Parametri utili:
 
 Per dettagli, vedi:
 - `docs/MANUAL.md`
+
+---
+Crafted with ❤️ by okno & gpt-5.2-pro
 - `docs/FAQ.md`

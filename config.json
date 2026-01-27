@@ -1,0 +1,16 @@
+{
+  "install_dir": "C:\\ext4win",
+  "distro": "Debian",
+  "language": "auto",
+  "offline_before_mount": true,
+  "auto_open_explorer": true,
+  "explorer_subpath": "",
+  "keepalive": {
+    "mode": "wsl_sleep"
+  },
+  "agent": {
+    "enabled": true,
+    "poll_seconds": 5,
+    "open_explorer_on_new_mount": true
+  }
+}

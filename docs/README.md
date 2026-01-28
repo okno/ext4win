@@ -80,5 +80,7 @@ Per dettagli, vedi:
 - `docs/MANUAL.md`
 
 ---
-Crafted with ❤️ by okno & gpt-5.2-pro
+
 - `docs/FAQ.md`
+
+Crafted with ❤️ by Pawel Zorzan Urban 'okno' - zorzan.pawel@gmail.com & gpt-5.2-pro

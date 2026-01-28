@@ -1,171 +1,148 @@
-#requires -Version 5.1
 <#
-Ext4Win Network Installer / Updater / Uninstaller (single file)
-
-Key goals (Dev/Sec/Op):
-- NO git required (downloads ZIP from GitHub)
-- Uses wget if present (or PowerShell alias), else curl.exe, else Invoke-WebRequest
-- Creates scheduled tasks with "HighestAvailable" + InteractiveToken (no password prompts)
-- Supports: Install, Update, Uninstall
-- Tray + Agent start automatically at logon (and can be started immediately)
-
-Repo: https://github.com/okno/ext4win
+Ext4WinInstaller.ps1
+Version: 4.2
+Single-file installer / updater / uninstaller for Ext4Win.
+- Downloads from GitHub as ZIP (no git required).
+- Prefers wget.exe if available; falls back to curl.exe or Invoke-WebRequest.
+- Creates scheduled tasks (Tray/Agent/Mount/Unmount/Update) and desktop shortcuts.
 #>
 
-[CmdletBinding(DefaultParameterSetName='Install')]
+[CmdletBinding()]
 param(
-    [Parameter()] [string] $InstallDir = 'C:\ext4win',
-    [Parameter()] [string] $Repo = 'okno/ext4win',
-    [Parameter()] [string] $Branch = 'main',
-    [Parameter()] [string] $ZipUrl,
-    [Parameter()] [string] $Distro = 'Debian',
-    [Parameter()] [ValidateSet('auto','it','en')] [string] $Language = 'auto',
-
-    [Parameter(ParameterSetName='Uninstall')] [switch] $Uninstall,
-    [Parameter(ParameterSetName='Update')]    [switch] $Update,
-
-    [Parameter()] [switch] $NoTray,
-    [Parameter()] [switch] $NoAgent,
-    [Parameter()] [switch] $Force
+  [string]$InstallDir = 'C:\ext4win',
+  [string]$Distro = 'Debian',
+  [ValidateSet('auto','it','en')][string]$Language = 'auto',
+  [string]$Repo = 'okno/ext4win',
+  [string]$Ref = 'main',
+  [switch]$Update,
+  [switch]$Uninstall,
+  [switch]$Force
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-function Write-HostInfo([string]$msg) { Write-Host $msg -ForegroundColor Cyan }
-function Write-HostWarn([string]$msg) { Write-Host $msg -ForegroundColor Yellow }
-function Write-HostErr([string]$msg)  { Write-Host $msg -ForegroundColor Red }
-
-function Test-IsAdmin {
-    try {
-        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-        $p  = New-Object Security.Principal.WindowsPrincipal($id)
-        return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    } catch { return $false }
-}
-
-function Ensure-Admin {
-    if (-not (Test-IsAdmin)) {
-        throw "Esegui questo installer come Amministratore (PowerShell 'Esegui come amministratore')."
-    }
-}
+function Write-Log([string]$m) { Write-Host $m }
 
 function Ensure-Dir([string]$p) {
-    New-Item -ItemType Directory -Force -Path $p | Out-Null
+  if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null }
 }
 
-function Escape-Xml([string]$s) {
-    if ($null -eq $s) { return '' }
-    return ($s -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;' -replace '"','&quot;' -replace "'","&apos;")
+function Find-Downloader {
+  $wget = Get-Command wget.exe -ErrorAction SilentlyContinue
+  if ($wget) { return @{ kind='wget'; path=$wget.Source } }
+  $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+  if ($curl) { return @{ kind='curl'; path=$curl.Source } }
+  return @{ kind='iwr'; path='' }
 }
 
-function Invoke-DownloadFile {
-    param(
-        [Parameter(Mandatory=$true)] [string] $Url,
-        [Parameter(Mandatory=$true)] [string] $OutFile
-    )
+function Download-File([string]$url, [string]$out) {
+  $dl = Find-Downloader
+  Write-Log ("Download: {0}" -f $url)
+  if ($dl.kind -eq 'wget') {
+    & $dl.path -O $out $url | Out-Null
+  } elseif ($dl.kind -eq 'curl') {
+    & $dl.path -L $url -o $out | Out-Null
+  } else {
+    Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+  }
+  if (-not (Test-Path -LiteralPath $out)) { throw "Download failed: $out not created" }
+  $len = (Get-Item -LiteralPath $out).Length
+  if ($len -lt 50000) { throw "Download too small ($len bytes). Possibly blocked." }
+}
 
-    # Prefer: real wget.exe if installed, else PowerShell alias wget, else curl.exe, else Invoke-WebRequest
-    $cmd = Get-Command wget -ErrorAction SilentlyContinue
+function Expand-Zip([string]$zip, [string]$to) {
+  if (Test-Path -LiteralPath $to) { Remove-Item -Recurse -Force -LiteralPath $to }
+  Expand-Archive -LiteralPath $zip -DestinationPath $to -Force
+}
 
-    if ($cmd -and $cmd.CommandType -eq 'Application') {
-        Write-HostInfo "Download (wget.exe): $Url"
-        & $cmd.Source -O $OutFile $Url | Out-Null
-        return
+function Get-ExtractRoot([string]$dir) {
+  $sub = Get-ChildItem -LiteralPath $dir -Directory | Select-Object -First 1
+  if (-not $sub) { throw "Unexpected ZIP layout: no root dir in $dir" }
+  return $sub.FullName
+}
+
+function Copy-Payload([string]$root, [string]$dest) {
+  # Prefer dist/, else copy key files if present.
+  $dist = Join-Path $root 'dist'
+  if (Test-Path -LiteralPath $dist) {
+    Ensure-Dir $dest
+    # Preserve config.json unless -Force
+    $cfg = Join-Path $dest 'config.json'
+    $tmpCfg = $null
+    if ((Test-Path -LiteralPath $cfg) -and (-not $Force)) {
+      $tmpCfg = Join-Path $env:TEMP ("ext4win_cfg_{0}.json" -f ([guid]::NewGuid().ToString('n')))
+      Copy-Item -LiteralPath $cfg -Destination $tmpCfg -Force
     }
-
-    if ($cmd -and $cmd.CommandType -eq 'Alias') {
-        Write-HostInfo "Download (wget alias -> Invoke-WebRequest): $Url"
-        if ($PSVersionTable.PSVersion.Major -lt 6) {
-            wget -Uri $Url -OutFile $OutFile -UseBasicParsing | Out-Null
-        } else {
-            wget -Uri $Url -OutFile $OutFile | Out-Null
-        }
-        return
-    }
-
-    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
-    if ($curl) {
-        Write-HostInfo "Download (curl.exe): $Url"
-        & $curl.Source -L -o $OutFile $Url | Out-Null
-        return
-    }
-
-    Write-HostInfo "Download (Invoke-WebRequest): $Url"
-    if ($PSVersionTable.PSVersion.Major -lt 6) {
-        Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing | Out-Null
-    } else {
-        Invoke-WebRequest -Uri $Url -OutFile $OutFile | Out-Null
-    }
+    Copy-Item -Path (Join-Path $dist '*') -Destination $dest -Recurse -Force
+    if ($tmpCfg) { Copy-Item -LiteralPath $tmpCfg -Destination $cfg -Force; Remove-Item $tmpCfg -Force -ErrorAction SilentlyContinue }
+  } else {
+    throw "dist/ not found in downloaded repo. Ensure the repo contains a dist folder."
+  }
 }
 
-function Get-DefaultZipUrl {
-    if (-not [string]::IsNullOrWhiteSpace($ZipUrl)) { return $ZipUrl }
-    # NOTE: no Git required. This is the official GitHub ZIP for the branch.
-    return ("https://github.com/{0}/archive/refs/heads/{1}.zip" -f $Repo, $Branch)
+function Write-Config([string]$dest) {
+  $cfgPath = Join-Path $dest 'config.json'
+  if ((Test-Path -LiteralPath $cfgPath) -and (-not $Force)) { return }
+  $cfg = @{
+    distro = $Distro
+    language = $Language
+    task_tray = 'Ext4Win_Tray'
+    task_agent = 'Ext4Win_Agent'
+    task_mount = 'Ext4Win_MountAll'
+    task_unmount = 'Ext4Win_UnmountAll'
+    task_update = 'Ext4Win_Update'
+  }
+  ($cfg | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $cfgPath -Encoding UTF8
 }
 
-function Stop-TaskSafe([string]$name) {
-    if ([string]::IsNullOrWhiteSpace($name)) { return }
-    $schtasks = Join-Path $env:SystemRoot 'System32\schtasks.exe'
-    try { & $schtasks /End /TN $name 2>$null | Out-Null } catch { }
+function Write-RunCmd([string]$dest, [string]$name, [string]$ps1, [string]$outlog) {
+  $cmdPath = Join-Path $dest $name
+  $logDir = Join-Path $dest 'logs'
+  Ensure-Dir $logDir
+  $content = @"
+@echo off
+setlocal
+if not exist "$logDir" mkdir "$logDir" >nul 2>nul
+echo ---- %date% %time% ---->> "$outlog"
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "$ps1" 1>> "$outlog" 2>>&1
+endlocal
+"@
+  Set-Content -LiteralPath $cmdPath -Value $content -Encoding ASCII
 }
 
-function Delete-TaskSafe([string]$name) {
-    if ([string]::IsNullOrWhiteSpace($name)) { return }
-    $schtasks = Join-Path $env:SystemRoot 'System32\schtasks.exe'
-    try { & $schtasks /Delete /TN $name /F 2>$null | Out-Null } catch { }
-}
-
-function Run-TaskSafe([string]$name) {
-    if ([string]::IsNullOrWhiteSpace($name)) { return }
-    $schtasks = Join-Path $env:SystemRoot 'System32\schtasks.exe'
-    try { & $schtasks /Run /TN $name 2>$null | Out-Null } catch { }
-}
-
-function New-TaskXml {
-    param(
-        [Parameter(Mandatory=$true)] [string] $UserSid,
-        [Parameter(Mandatory=$true)] [string] $Command,
-        [Parameter(Mandatory=$true)] [string] $Arguments,
-        [Parameter(Mandatory=$true)] [string] $WorkingDirectory,
-        [Parameter(Mandatory=$true)] [bool]   $OnLogon,
-        [Parameter()] [bool] $Hidden = $true
-    )
-
-    $cmdEsc = Escape-Xml $Command
-    $argEsc = Escape-Xml $Arguments
-    $wdEsc  = Escape-Xml $WorkingDirectory
-    $hid    = if ($Hidden) { 'true' } else { 'false' }
-
-    $triggers = if ($OnLogon) {
+function New-TaskXml([string]$taskName, [string]$command, [string]$arguments, [string]$workDir, [bool]$onLogon=$true, [bool]$highest=$true) {
+  $user = "{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME
+  $rl = if ($highest) { 'HighestAvailable' } else { 'LeastPrivilege' }
+  $trigger = if ($onLogon) {
 @"
-  <Triggers>
     <LogonTrigger>
       <Enabled>true</Enabled>
-      <UserId>$UserSid</UserId>
     </LogonTrigger>
-  </Triggers>
 "@
-    } else {
+  } else {
 @"
-  <Triggers />
+    <RegistrationTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT0S</Delay>
+    </RegistrationTrigger>
 "@
-    }
-
-@"
+  }
+  return @"
 <?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Author>Ext4Win</Author>
-    <Description>Ext4Win task</Description>
+    <Description>$taskName</Description>
   </RegistrationInfo>
-$triggers
+  <Triggers>
+$trigger
+  </Triggers>
   <Principals>
     <Principal id="Author">
-      <UserId>$UserSid</UserId>
+      <UserId>$user</UserId>
       <LogonType>InteractiveToken</LogonType>
-      <RunLevel>HighestAvailable</RunLevel>
+      <RunLevel>$rl</RunLevel>
     </Principal>
   </Principals>
   <Settings>
@@ -181,7 +158,7 @@ $triggers
     </IdleSettings>
     <AllowStartOnDemand>true</AllowStartOnDemand>
     <Enabled>true</Enabled>
-    <Hidden>$hid</Hidden>
+    <Hidden>false</Hidden>
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
@@ -189,194 +166,131 @@ $triggers
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>$cmdEsc</Command>
-      <Arguments>$argEsc</Arguments>
-      <WorkingDirectory>$wdEsc</WorkingDirectory>
+      <Command>$command</Command>
+      <Arguments>$arguments</Arguments>
+      <WorkingDirectory>$workDir</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>
 "@
 }
 
-function Ensure-TaskXml {
-    param(
-        [Parameter(Mandatory=$true)] [string] $Name,
-        [Parameter(Mandatory=$true)] [string] $Xml
-    )
-    $schtasks = Join-Path $env:SystemRoot 'System32\schtasks.exe'
-    $tmp = Join-Path $env:TEMP ("ext4win_task_{0}.xml" -f ([Guid]::NewGuid().ToString('N')))
-    Set-Content -Path $tmp -Value $Xml -Encoding Unicode
-    try {
-        & $schtasks /Create /TN $Name /XML $tmp /F | Out-Null
-    } finally {
-        Remove-Item -Force -ErrorAction SilentlyContinue $tmp | Out-Null
-    }
+function Install-TaskXml([string]$name, [string]$xml) {
+  $tmp = Join-Path $env:TEMP ("{0}.xml" -f ([guid]::NewGuid().ToString('n')))
+  Set-Content -LiteralPath $tmp -Value $xml -Encoding Unicode
+  & schtasks.exe /Create /TN $name /XML $tmp /F | Out-Null
+  Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
 }
 
-function Merge-Config {
-    param([string]$CfgPath)
+function Create-Tasks([string]$dest) {
+  $runTray = Join-Path $dest 'RunTray.cmd'
+  $runAgent = Join-Path $dest 'RunAgent.cmd'
+  $trayPs1 = Join-Path $dest 'Ext4WinTray.ps1'
+  $agentPs1 = Join-Path $dest 'Ext4WinAgent.ps1'
+  $ctl = Join-Path $dest 'Ext4WinCtl.ps1'
+  $installer = Join-Path $dest 'Ext4WinInstaller.ps1'
 
-    $obj = $null
-    if (Test-Path $CfgPath) {
-        try { $obj = Get-Content $CfgPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $obj = $null }
-    }
-    if ($null -eq $obj) { $obj = [pscustomobject]@{} }
+  # Wrappers (stdout/stderr always logged)
+  Write-RunCmd $dest 'RunTray.cmd' $trayPs1 (Join-Path $dest 'logs\Ext4WinTray.out.log')
+  Write-RunCmd $dest 'RunAgent.cmd' $agentPs1 (Join-Path $dest 'logs\Ext4WinAgent.out.log')
 
-    # Keep user's values when present; set defaults when missing
-    if (-not ($obj.PSObject.Properties.Name -contains 'install_dir')) { $obj | Add-Member -NotePropertyName install_dir -NotePropertyValue $InstallDir -Force }
-    if (-not ($obj.PSObject.Properties.Name -contains 'distro')) { $obj | Add-Member -NotePropertyName distro -NotePropertyValue $Distro -Force } else { $obj.distro = $Distro }
-    if (-not ($obj.PSObject.Properties.Name -contains 'language')) { $obj | Add-Member -NotePropertyName language -NotePropertyValue $Language -Force } else { $obj.language = $Language }
+  # Tray (on logon)
+  $xmlTray = New-TaskXml 'Ext4Win Tray' 'cmd.exe' ("/c `"$runTray`"") $dest $true $true
+  Install-TaskXml 'Ext4Win_Tray' $xmlTray
 
-    if (-not ($obj.PSObject.Properties.Name -contains 'task_tray'))    { $obj | Add-Member -NotePropertyName task_tray -NotePropertyValue 'Ext4Win_Tray' -Force }
-    if (-not ($obj.PSObject.Properties.Name -contains 'task_agent'))   { $obj | Add-Member -NotePropertyName task_agent -NotePropertyValue 'Ext4Win_Agent' -Force }
-    if (-not ($obj.PSObject.Properties.Name -contains 'task_mount'))   { $obj | Add-Member -NotePropertyName task_mount -NotePropertyValue 'Ext4Win_MountAll' -Force }
-    if (-not ($obj.PSObject.Properties.Name -contains 'task_unmount')) { $obj | Add-Member -NotePropertyName task_unmount -NotePropertyValue 'Ext4Win_UnmountAll' -Force }
-    if (-not ($obj.PSObject.Properties.Name -contains 'task_update'))  { $obj | Add-Member -NotePropertyName task_update -NotePropertyValue 'Ext4Win_Update' -Force }
+  # Agent (on logon)
+  if (Test-Path -LiteralPath $agentPs1) {
+    $xmlAgent = New-TaskXml 'Ext4Win Agent' 'cmd.exe' ("/c `"$runAgent`"") $dest $true $true
+    Install-TaskXml 'Ext4Win_Agent' $xmlAgent
+  }
 
-    $obj | ConvertTo-Json -Depth 10 | Set-Content -Path $CfgPath -Encoding UTF8
+  # MountAll / UnmountAll (on demand)
+  $xmlMount = New-TaskXml 'Ext4Win MountAll' 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"$ctl`" -Action MountAll") $dest $false $true
+  Install-TaskXml 'Ext4Win_MountAll' $xmlMount
+
+  $xmlUm = New-TaskXml 'Ext4Win UnmountAll' 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"$ctl`" -Action UnmountAll") $dest $false $true
+  Install-TaskXml 'Ext4Win_UnmountAll' $xmlUm
+
+  # Update task (on demand)
+  $xmlUp = New-TaskXml 'Ext4Win Update' 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"$installer`" -Update") $dest $false $true
+  Install-TaskXml 'Ext4Win_Update' $xmlUp
 }
 
-function Copy-Payload {
-    param(
-        [Parameter(Mandatory=$true)] [string] $SrcRoot,
-        [Parameter(Mandatory=$true)] [string] $DstRoot
-    )
-
-    # Copy everything except .git / .github (if present)
-    $exclude = @('.git','.github')
-
-    Get-ChildItem -LiteralPath $SrcRoot -Force | ForEach-Object {
-        if ($exclude -contains $_.Name) { return }
-        $dst = Join-Path $DstRoot $_.Name
-        if ($_.PSIsContainer) {
-            Copy-Item -LiteralPath $_.FullName -Destination $dst -Recurse -Force
-        } else {
-            # Preserve existing config.json unless -Force
-            if ($_.Name -ieq 'config.json' -and (Test-Path $dst) -and (-not $Force)) {
-                return
-            }
-            Copy-Item -LiteralPath $_.FullName -Destination $dst -Force
-        }
-    }
+function Create-DesktopShortcut([string]$name, [string]$target, [string]$args) {
+  try {
+    $wsh = New-Object -ComObject WScript.Shell
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    $lnk = Join-Path $desktop ($name + '.lnk')
+    $s = $wsh.CreateShortcut($lnk)
+    $s.TargetPath = $target
+    $s.Arguments = $args
+    $s.WorkingDirectory = $InstallDir
+    $s.IconLocation = (Join-Path $InstallDir 'file.ico')
+    $s.Save()
+  } catch {}
 }
 
-function Install-OrUpdate {
-    Ensure-Admin
+function Remove-Tasks {
+  foreach ($t in @('Ext4Win_Tray','Ext4Win_Agent','Ext4Win_MountAll','Ext4Win_UnmountAll','Ext4Win_Update')) {
+    & schtasks.exe /Delete /TN $t /F 2>$null | Out-Null
+  }
+}
 
-    $zip = Get-DefaultZipUrl
-    Write-HostInfo "Ext4Win => InstallDir: $InstallDir"
-    Write-HostInfo "Source ZIP : $zip"
-    Write-HostInfo "Distro     : $Distro"
-    Write-HostInfo "Language   : $Language"
-    Write-HostInfo "Mode       : " + ($(if ($Update) { 'UPDATE' } else { 'INSTALL' }))
-
-    # stop running tasks (update-safe)
-    Stop-TaskSafe 'Ext4Win_Tray'
-    Stop-TaskSafe 'Ext4Win_Agent'
-    Start-Sleep -Seconds 1
-
-    $tmpZip = Join-Path $env:TEMP ("ext4win_{0}.zip" -f ([Guid]::NewGuid().ToString('N')))
-    $tmpDir = Join-Path $env:TEMP ("ext4win_{0}" -f ([Guid]::NewGuid().ToString('N')))
-
-    try {
-        Invoke-DownloadFile -Url $zip -OutFile $tmpZip
-
-        Ensure-Dir $tmpDir
-        Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
-
-        $root = Get-ChildItem -LiteralPath $tmpDir -Directory | Select-Object -First 1
-        if ($null -eq $root) { throw "ZIP estratto ma cartella root non trovata." }
-
-        Ensure-Dir $InstallDir
-        Copy-Payload -SrcRoot $root.FullName -DstRoot $InstallDir
-
-        # Ensure logs/run dirs exist
-        Ensure-Dir (Join-Path $InstallDir 'logs')
-        Ensure-Dir (Join-Path $InstallDir 'run')
-
-        # Write/merge config
-        $cfgPath = Join-Path $InstallDir 'config.json'
-        Merge-Config -CfgPath $cfgPath
-
-        # Copy this installer into install dir (so tray can call -Update)
-        Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $InstallDir 'Ext4WinInstaller.ps1') -Force
-
-        # Create scheduled tasks (XML import)
-        $userSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
-        $ps = (Get-Command powershell.exe -ErrorAction Stop).Source
-
-        $trayArgs   = "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$InstallDir\Ext4WinTray.ps1`""
-        $agentArgs  = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$InstallDir\Ext4WinAgent.ps1`""
-        $mountArgs  = "-NoProfile -ExecutionPolicy Bypass -File `"$InstallDir\Ext4WinCtl.ps1`" -Action MountAll"
-        $umountArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$InstallDir\Ext4WinCtl.ps1`" -Action UnmountAll"
-        $updArgs    = "-NoProfile -ExecutionPolicy Bypass -File `"$InstallDir\Ext4WinInstaller.ps1`" -Update -InstallDir `"$InstallDir`" -Repo `"$Repo`" -Branch `"$Branch`" -Distro `"$Distro`" -Language `"$Language`""
-
-        Ensure-TaskXml -Name 'Ext4Win_Tray'     -Xml (New-TaskXml -UserSid $userSid -Command $ps -Arguments $trayArgs   -WorkingDirectory $InstallDir -OnLogon $true  -Hidden $true)
-        Ensure-TaskXml -Name 'Ext4Win_Agent'    -Xml (New-TaskXml -UserSid $userSid -Command $ps -Arguments $agentArgs  -WorkingDirectory $InstallDir -OnLogon $true  -Hidden $true)
-        Ensure-TaskXml -Name 'Ext4Win_MountAll' -Xml (New-TaskXml -UserSid $userSid -Command $ps -Arguments $mountArgs  -WorkingDirectory $InstallDir -OnLogon $false -Hidden $true)
-        Ensure-TaskXml -Name 'Ext4Win_UnmountAll' -Xml (New-TaskXml -UserSid $userSid -Command $ps -Arguments $umountArgs -WorkingDirectory $InstallDir -OnLogon $false -Hidden $true)
-        Ensure-TaskXml -Name 'Ext4Win_Update'   -Xml (New-TaskXml -UserSid $userSid -Command $ps -Arguments $updArgs    -WorkingDirectory $InstallDir -OnLogon $false -Hidden $true)
-
-        if (-not $NoTray)  { Run-TaskSafe 'Ext4Win_Tray' }
-        if (-not $NoAgent) { Run-TaskSafe 'Ext4Win_Agent' }
-
-        Write-HostInfo "OK: Ext4Win install/update completato."
-        Write-HostInfo "Test (Admin):"
-        Write-Host "  $InstallDir\Ext4WinCtl.ps1 -Action Prereqs"
-        Write-Host "  $InstallDir\Ext4WinCtl.ps1 -Action ListExt4"
-        Write-Host "  $InstallDir\Ext4WinCtl.ps1 -Action MountAll"
-        Write-Host "  $InstallDir\Ext4WinCtl.ps1 -Action ListMounts"
-        Write-Host ""
-        Write-HostInfo "Tray task: Ext4Win_Tray  | Update task: Ext4Win_Update"
-    } finally {
-        Remove-Item -Force -ErrorAction SilentlyContinue $tmpZip | Out-Null
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmpDir | Out-Null
+function Remove-Shortcuts {
+  try {
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    foreach ($n in @('MONTA','SMONTA')) {
+      $p = Join-Path $desktop ($n + '.lnk')
+      if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force }
     }
+  } catch {}
+}
+
+function Do-InstallOrUpdate {
+  Ensure-Dir $InstallDir
+  Ensure-Dir (Join-Path $InstallDir 'logs')
+
+  $url = "https://codeload.github.com/{0}/zip/refs/heads/{1}" -f $Repo, $Ref
+  $zip = Join-Path $env:TEMP ("ext4win_{0}_{1}.zip" -f ($Ref), (Get-Date -Format 'yyyyMMdd_HHmmss'))
+  $tmp = Join-Path $env:TEMP ("ext4win_extract_{0}" -f ([guid]::NewGuid().ToString('n')))
+
+  Download-File $url $zip
+  Expand-Zip $zip $tmp
+  $root = Get-ExtractRoot $tmp
+
+  Copy-Payload $root $InstallDir
+  Write-Config $InstallDir
+
+  # Ensure installer self-copy (so Update task works)
+  Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $InstallDir 'Ext4WinInstaller.ps1') -Force
+
+  Create-Tasks $InstallDir
+
+  # Desktop shortcuts (Mount/Unmount via tasks)
+  Create-DesktopShortcut 'MONTA' "$env:WINDIR\System32\schtasks.exe" "/Run /TN Ext4Win_MountAll"
+  Create-DesktopShortcut 'SMONTA' "$env:WINDIR\System32\schtasks.exe" "/Run /TN Ext4Win_UnmountAll"
+
+  # Start tray now
+  & schtasks.exe /Run /TN Ext4Win_Tray | Out-Null
+
+  Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+
+  Write-Log "OK: install/update completato in $InstallDir"
+  Write-Log "Tray log: $InstallDir\logs\Ext4WinTray.out.log"
 }
 
 function Do-Uninstall {
-    Ensure-Admin
-
-    Write-HostWarn "UNINSTALL: rimozione Ext4Win da $InstallDir"
-
-    # stop tasks
-    Stop-TaskSafe 'Ext4Win_Tray'
-    Stop-TaskSafe 'Ext4Win_Agent'
-    Stop-TaskSafe 'Ext4Win_MountAll'
-    Stop-TaskSafe 'Ext4Win_UnmountAll'
-    Stop-TaskSafe 'Ext4Win_Update'
-    Start-Sleep -Seconds 1
-
-    # delete tasks
-    Delete-TaskSafe 'Ext4Win_Tray'
-    Delete-TaskSafe 'Ext4Win_Agent'
-    Delete-TaskSafe 'Ext4Win_MountAll'
-    Delete-TaskSafe 'Ext4Win_UnmountAll'
-    Delete-TaskSafe 'Ext4Win_Update'
-
-    # best-effort: unmount and shutdown
-    $wsl = Join-Path $env:SystemRoot 'System32\wsl.exe'
-    try { & $wsl --shutdown | Out-Null } catch { }
-
-    # remove install dir (keep logs? you can manually backup)
-    try {
-        if (Test-Path $InstallDir) {
-            Remove-Item -Recurse -Force -LiteralPath $InstallDir
-        }
-    } catch {
-        Write-HostWarn ("Impossibile eliminare completamente la cartella. Rimuovi manualmente: {0}" -f $InstallDir)
-    }
-
-    Write-HostInfo "OK: uninstall completato."
+  Remove-Tasks
+  Remove-Shortcuts
+  try { if (Test-Path -LiteralPath $InstallDir) { Remove-Item -LiteralPath $InstallDir -Recurse -Force } } catch {}
+  Write-Log "OK: disinstallato."
 }
 
-# ---------------------------
+# -----------------------------
 # Main
-# ---------------------------
-try {
-    if ($Uninstall) { Do-Uninstall; return }
-    Install-OrUpdate
-} catch {
-    Write-HostErr $_.Exception.Message
-    exit 1
-}
+# -----------------------------
+if ($Uninstall) { Do-Uninstall; exit 0 }
+if ($Update) { Do-InstallOrUpdate; exit 0 }
+
+Do-InstallOrUpdate

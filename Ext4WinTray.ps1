@@ -1,18 +1,20 @@
 <#
 Ext4WinTray.ps1
-Version: 4.3
+Version: 4.4
 Windows tray UI for Ext4Win (WSL2 ext4 mount helper)
 
-Fixes:
-- No invalid assembly references (e.g., System.Drawing.Drawing2D)
-- Added global try/catch to log unexpected failures
-- Designed to be started via scheduled task OR manually
+Fixes in v4.4:
+- Removed invalid PowerShell regex syntax (no "'m" multiline flag outside string)
+- Avoids non-ASCII in source to prevent encoding-related parsing issues on Windows PowerShell 5.1
+- Robust scheduled task state parsing without multiline regex
+- Still provides: IT/EN, Shutdown WSL, disk space bar, status icon colors
 
-Features:
-- Bilingual IT/EN (auto/it/en)
-- Status icon (dot overlay): Green=Mounted, Red=Error, White=Idle
-- Menu: Mount/Unmount All, Partitions list, Disk space bars, Open WSL folder, Shutdown WSL, Agent controls, Service controls (if present), Update, Language, Exit
-- Uses \\wsl.localhost\<Distro>\... (avoids issues with \\wsl$)
+Run:
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File C:\ext4win\Ext4WinTray.ps1
+
+Logs:
+  C:\ext4win\logs\Ext4WinTray.runtime.log (internal)
+  C:\ext4win\logs\Ext4WinTray.out.log     (stdout/stderr if started via RunTray.cmd)
 #>
 
 Set-StrictMode -Off
@@ -64,7 +66,7 @@ $CtlPath = Join-Path $InstallDir 'Ext4WinCtl.ps1'
 $IconPath = Join-Path $InstallDir 'file.ico'
 
 # -----------------------------
-# i18n strings
+# i18n strings (ASCII-only source)
 # -----------------------------
 $Strings = @{
     it = @{
@@ -93,7 +95,7 @@ $Strings = @{
         langIt      = 'Italiano'
         langEn      = 'English'
         exit        = 'Esci'
-        tip         = 'Ext4Win – Mount ext4 via WSL2'
+        tip         = 'Ext4Win - Mount ext4 via WSL2'
     }
     en = @{
         title       = 'Ext4Win'
@@ -121,7 +123,7 @@ $Strings = @{
         langIt      = 'Italiano'
         langEn      = 'English'
         exit        = 'Exit'
-        tip         = 'Ext4Win – Mount ext4 via WSL2'
+        tip         = 'Ext4Win - Mount ext4 via WSL2'
     }
 }
 
@@ -181,7 +183,6 @@ if (-not $formsOk) {
     exit 1
 }
 if (-not $drawOk) {
-    # We can still try to run with SystemIcons if available; log but don't abort.
     Write-TrayLog -Level warn -Message 'Cannot explicitly load System.Drawing. Will attempt to continue.'
 }
 
@@ -220,16 +221,23 @@ function Stop-Task([string]$Name) {
         }
     } catch {}
 }
+
 function Get-TaskState([string]$Name) {
     try {
-        if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+        if (Get-Command Get-ScheduledTaskInfo -ErrorAction SilentlyContinue) {
             $i = Get-ScheduledTaskInfo -TaskName $Name -ErrorAction Stop
             return $i.State.ToString()
         }
     } catch {}
+
     try {
-        $out = (& schtasks.exe /Query /TN $Name /FO LIST /V 2>$null) -join "`n"
-        if ($out -match '^\s*(Stato|Status)\s*:\s*(.+)\s*$'m) { return $Matches[2].Trim() }
+        $lines = & schtasks.exe /Query /TN $Name /FO LIST /V 2>$null
+        foreach ($ln in $lines) {
+            # Match both Italian and English output
+            if ($ln -match '^\s*(Stato|Status)\s*:\s*(.+)\s*$') {
+                return $Matches[2].Trim()
+            }
+        }
     } catch {}
     return 'Unknown'
 }
@@ -282,14 +290,16 @@ function Human-Bytes([Int64]$b) {
     while ($v -ge 1024 -and $i -lt ($units.Count-1)) { $v /= 1024; $i++ }
     return ("{0:N1} {1}" -f $v, $units[$i])
 }
-function Bar([int]$pct, [int]$len=10) {
+
+function Bar([int]$pct, [int]$len) {
     if ($pct -lt 0) { $pct = 0 }
     if ($pct -gt 100) { $pct = 100 }
     $filled = [int][Math]::Round(($pct/100.0)*$len)
     if ($filled -gt $len) { $filled = $len }
     $empty = $len - $filled
-    return ('█' * $filled) + ('░' * $empty)
+    return ('#' * $filled) + ('-' * $empty)
 }
+
 function Get-DiskSpaceLines {
     $lines = @()
     $mounts = Get-Mounts
@@ -351,7 +361,7 @@ $IconMounted = New-StatusIcon ([System.Drawing.Color]::Lime)
 $IconError   = New-StatusIcon ([System.Drawing.Color]::Red)
 
 # -----------------------------
-# Single instance mutex (session-scoped to avoid privilege issues)
+# Single instance mutex
 # -----------------------------
 $mutex = $null
 try {
@@ -364,7 +374,7 @@ try {
 } catch {}
 
 # -----------------------------
-# UI: NotifyIcon + Menu
+# UI + main loop (global try/catch)
 # -----------------------------
 try {
     $notify = New-Object System.Windows.Forms.NotifyIcon
@@ -375,44 +385,37 @@ try {
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
     $notify.ContextMenuStrip = $menu
 
-    # Status header
     $statusItem = New-Object System.Windows.Forms.ToolStripMenuItem
     $statusItem.Enabled = $false
-    $null = $menu.Items.Add($statusItem)
-    $null = $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    [void]$menu.Items.Add($statusItem)
+    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
-    # Mount/Unmount
     $miMountAll = New-Object System.Windows.Forms.ToolStripMenuItem (T 'mountAll')
     $miMountAll.Add_Click({ Run-Task $TaskMount }) | Out-Null
-    $null = $menu.Items.Add($miMountAll)
+    [void]$menu.Items.Add($miMountAll)
 
     $miUnmountAll = New-Object System.Windows.Forms.ToolStripMenuItem (T 'unmountAll')
     $miUnmountAll.Add_Click({ Run-Task $TaskUmount }) | Out-Null
-    $null = $menu.Items.Add($miUnmountAll)
+    [void]$menu.Items.Add($miUnmountAll)
 
-    # Partitions submenu (informational)
     $miParts = New-Object System.Windows.Forms.ToolStripMenuItem (T 'partitions')
-    $null = $menu.Items.Add($miParts)
+    [void]$menu.Items.Add($miParts)
 
-    # Disk space submenu
     $miSpace = New-Object System.Windows.Forms.ToolStripMenuItem (T 'diskSpace')
-    $null = $menu.Items.Add($miSpace)
+    [void]$menu.Items.Add($miSpace)
 
-    $null = $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
-    # Open WSL folder
     $miOpenWsl = New-Object System.Windows.Forms.ToolStripMenuItem (T 'openWsl')
     $miOpenWsl.Add_Click({ Open-WslFolder }) | Out-Null
-    $null = $menu.Items.Add($miOpenWsl)
+    [void]$menu.Items.Add($miOpenWsl)
 
-    # Shutdown WSL
     $miShutdown = New-Object System.Windows.Forms.ToolStripMenuItem (T 'shutdownWsl')
     $miShutdown.Add_Click({ Shutdown-Wsl }) | Out-Null
-    $null = $menu.Items.Add($miShutdown)
+    [void]$menu.Items.Add($miShutdown)
 
-    $null = $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
-    # Agent submenu
     $miAgent = New-Object System.Windows.Forms.ToolStripMenuItem (T 'agent')
     $miAgentStart = New-Object System.Windows.Forms.ToolStripMenuItem (T 'agentStart')
     $miAgentStart.Add_Click({ Run-Task $TaskAgent }) | Out-Null
@@ -420,12 +423,12 @@ try {
     $miAgentStop.Add_Click({ Stop-Task $TaskAgent }) | Out-Null
     $miAgentRestart = New-Object System.Windows.Forms.ToolStripMenuItem (T 'agentRestart')
     $miAgentRestart.Add_Click({ try { Stop-Task $TaskAgent; Start-Sleep -Seconds 1; Run-Task $TaskAgent } catch {} }) | Out-Null
-    $null = $miAgent.DropDownItems.Add($miAgentStart)
-    $null = $miAgent.DropDownItems.Add($miAgentStop)
-    $null = $miAgent.DropDownItems.Add($miAgentRestart)
-    $null = $menu.Items.Add($miAgent)
 
-    # Service submenu (optional)
+    [void]$miAgent.DropDownItems.Add($miAgentStart)
+    [void]$miAgent.DropDownItems.Add($miAgentStop)
+    [void]$miAgent.DropDownItems.Add($miAgentRestart)
+    [void]$menu.Items.Add($miAgent)
+
     $svc = $null
     try { $svc = Get-Service -Name 'Ext4WinSvc' -ErrorAction SilentlyContinue } catch {}
     if ($null -ne $svc) {
@@ -436,18 +439,16 @@ try {
         $miSvcStart.Add_Click({ try { Start-Service -Name 'Ext4WinSvc' } catch {} }) | Out-Null
         $miSvcStop.Add_Click({ try { Stop-Service -Name 'Ext4WinSvc' -Force } catch {} }) | Out-Null
         $miSvcRestart.Add_Click({ try { Restart-Service -Name 'Ext4WinSvc' -Force } catch {} }) | Out-Null
-        $null = $miSvc.DropDownItems.Add($miSvcStart)
-        $null = $miSvc.DropDownItems.Add($miSvcStop)
-        $null = $miSvc.DropDownItems.Add($miSvcRestart)
-        $null = $menu.Items.Add($miSvc)
+        [void]$miSvc.DropDownItems.Add($miSvcStart)
+        [void]$miSvc.DropDownItems.Add($miSvcStop)
+        [void]$miSvc.DropDownItems.Add($miSvcRestart)
+        [void]$menu.Items.Add($miSvc)
     }
 
-    # Update
     $miUpdate = New-Object System.Windows.Forms.ToolStripMenuItem (T 'update')
     $miUpdate.Add_Click({ Run-Task $TaskUpdate }) | Out-Null
-    $null = $menu.Items.Add($miUpdate)
+    [void]$menu.Items.Add($miUpdate)
 
-    # Language submenu
     $miLang = New-Object System.Windows.Forms.ToolStripMenuItem (T 'language')
     $miLangAuto = New-Object System.Windows.Forms.ToolStripMenuItem (T 'langAuto')
     $miLangIt = New-Object System.Windows.Forms.ToolStripMenuItem (T 'langIt')
@@ -465,27 +466,27 @@ try {
     $miLangAuto.Add_Click({ Save-Language 'auto'; Restart-Tray }) | Out-Null
     $miLangIt.Add_Click({ Save-Language 'it'; Restart-Tray }) | Out-Null
     $miLangEn.Add_Click({ Save-Language 'en'; Restart-Tray }) | Out-Null
-    $null = $miLang.DropDownItems.Add($miLangAuto)
-    $null = $miLang.DropDownItems.Add($miLangIt)
-    $null = $miLang.DropDownItems.Add($miLangEn)
-    $null = $menu.Items.Add($miLang)
 
-    $null = $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    [void]$miLang.DropDownItems.Add($miLangAuto)
+    [void]$miLang.DropDownItems.Add($miLangIt)
+    [void]$miLang.DropDownItems.Add($miLangEn)
+    [void]$menu.Items.Add($miLang)
 
-    # Exit
+    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
     $miExit = New-Object System.Windows.Forms.ToolStripMenuItem (T 'exit')
     $miExit.Add_Click({
         try { $notify.Visible = $false; $notify.Dispose() } catch {}
         try { if ($mutex) { $mutex.ReleaseMutex() | Out-Null; $mutex.Dispose() } } catch {}
         try { [System.Windows.Forms.Application]::Exit() } catch {}
     }) | Out-Null
-    $null = $menu.Items.Add($miExit)
+    [void]$menu.Items.Add($miExit)
 
-    # Refresh loop
     function Refresh-Menu {
         $err = $false
         $mounts = @()
         $parts = @()
+
         try { $mounts = Get-Mounts } catch { $err = $true }
         try { $parts = Get-Ext4Parts } catch { $err = $true }
 
@@ -495,7 +496,6 @@ try {
 
         $statusItem.Text = ("{0} | Agent: {1} | ext4: {2} | {3}: {4}" -f (T 'title'), $agentState, $pCount, (T 'mounted'), $mCount)
 
-        # Icon state
         if ($err) {
             $notify.Icon = $IconError
             $notify.Text = (T 'error')
@@ -507,13 +507,12 @@ try {
             $notify.Text = (T 'idle')
         }
 
-        # Partitions submenu
         try {
             $miParts.DropDownItems.Clear()
             if ($pCount -eq 0) {
-                $it = New-Object System.Windows.Forms.ToolStripMenuItem '—'
+                $it = New-Object System.Windows.Forms.ToolStripMenuItem '-'
                 $it.Enabled = $false
-                $null = $miParts.DropDownItems.Add($it)
+                [void]$miParts.DropDownItems.Add($it)
             } else {
                 foreach ($p in $parts) {
                     $dn = $p.DiskNumber
@@ -522,24 +521,23 @@ try {
                     if ($p.DiskFriendlyName) { $name = "{0} (Disk {1} Part {2})" -f $p.DiskFriendlyName, $dn, $pn }
                     $it = New-Object System.Windows.Forms.ToolStripMenuItem $name
                     $it.Enabled = $false
-                    $null = $miParts.DropDownItems.Add($it)
+                    [void]$miParts.DropDownItems.Add($it)
                 }
             }
         } catch {}
 
-        # Disk space submenu
         try {
             $miSpace.DropDownItems.Clear()
             $lines = Get-DiskSpaceLines
             if (@($lines).Count -eq 0) {
-                $it = New-Object System.Windows.Forms.ToolStripMenuItem '—'
+                $it = New-Object System.Windows.Forms.ToolStripMenuItem '-'
                 $it.Enabled = $false
-                $null = $miSpace.DropDownItems.Add($it)
+                [void]$miSpace.DropDownItems.Add($it)
             } else {
                 foreach ($ln in $lines) {
                     $it = New-Object System.Windows.Forms.ToolStripMenuItem $ln
                     $it.Enabled = $false
-                    $null = $miSpace.DropDownItems.Add($it)
+                    [void]$miSpace.DropDownItems.Add($it)
                 }
             }
         } catch {}

@@ -1,10 +1,22 @@
 <#
 Ext4WinInstaller.ps1
-Version: 4.2
+Version: 4.3
 Single-file installer / updater / uninstaller for Ext4Win.
 - Downloads from GitHub as ZIP (no git required).
-- Prefers wget.exe if available; falls back to curl.exe or Invoke-WebRequest.
-- Creates scheduled tasks (Tray/Agent/Mount/Unmount/Update) and desktop shortcuts.
+- Prefers wget (PowerShell alias) / wget.exe if present; fallback to Invoke-WebRequest; last resort curl.exe.
+- Supports repos that ship installable files in repo root (docs/, icons/) OR in dist/.
+- Can repair tasks without downloading.
+
+Examples:
+  Install/Update:
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\Ext4WinInstaller.ps1
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\Ext4WinInstaller.ps1 -Update
+
+  Repair tasks only:
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\Ext4WinInstaller.ps1 -RepairTasks
+
+  Uninstall:
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\Ext4WinInstaller.ps1 -Uninstall
 #>
 
 [CmdletBinding()]
@@ -16,6 +28,7 @@ param(
   [string]$Ref = 'main',
   [switch]$Update,
   [switch]$Uninstall,
+  [switch]$RepairTasks,
   [switch]$Force
 )
 
@@ -28,27 +41,34 @@ function Ensure-Dir([string]$p) {
   if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null }
 }
 
-function Find-Downloader {
-  $wget = Get-Command wget.exe -ErrorAction SilentlyContinue
-  if ($wget) { return @{ kind='wget'; path=$wget.Source } }
-  $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
-  if ($curl) { return @{ kind='curl'; path=$curl.Source } }
-  return @{ kind='iwr'; path='' }
-}
-
 function Download-File([string]$url, [string]$out) {
-  $dl = Find-Downloader
   Write-Log ("Download: {0}" -f $url)
-  if ($dl.kind -eq 'wget') {
-    & $dl.path -O $out $url | Out-Null
-  } elseif ($dl.kind -eq 'curl') {
-    & $dl.path -L $url -o $out | Out-Null
+  # Prefer PowerShell wget alias (Invoke-WebRequest) if available
+  $wgetCmd = Get-Command wget -ErrorAction SilentlyContinue
+  if ($wgetCmd -and $wgetCmd.CommandType -eq 'Alias') {
+    # wget is an alias for Invoke-WebRequest on Windows PowerShell
+    wget -Uri $url -OutFile $out -UseBasicParsing | Out-Null
   } else {
-    Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+    $wgetExe = Get-Command wget.exe -ErrorAction SilentlyContinue
+    if ($wgetExe) {
+      & $wgetExe.Source -O $out $url | Out-Null
+    } else {
+      # fallback to Invoke-WebRequest
+      Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+    }
   }
+
   if (-not (Test-Path -LiteralPath $out)) { throw "Download failed: $out not created" }
   $len = (Get-Item -LiteralPath $out).Length
-  if ($len -lt 50000) { throw "Download too small ($len bytes). Possibly blocked." }
+  if ($len -lt 50000) {
+    # last resort: curl.exe
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if ($curl) {
+      & $curl.Source -L $url -o $out | Out-Null
+      $len = (Get-Item -LiteralPath $out).Length
+    }
+    if ($len -lt 50000) { throw "Download too small ($len bytes). Possibly blocked." }
+  }
 }
 
 function Expand-Zip([string]$zip, [string]$to) {
@@ -63,22 +83,56 @@ function Get-ExtractRoot([string]$dir) {
 }
 
 function Copy-Payload([string]$root, [string]$dest) {
-  # Prefer dist/, else copy key files if present.
+  # If dist exists, copy from dist; else copy from root (repo ships payload in root)
   $dist = Join-Path $root 'dist'
+  $src = $null
+  $mode = ''
   if (Test-Path -LiteralPath $dist) {
-    Ensure-Dir $dest
-    # Preserve config.json unless -Force
-    $cfg = Join-Path $dest 'config.json'
-    $tmpCfg = $null
-    if ((Test-Path -LiteralPath $cfg) -and (-not $Force)) {
-      $tmpCfg = Join-Path $env:TEMP ("ext4win_cfg_{0}.json" -f ([guid]::NewGuid().ToString('n')))
-      Copy-Item -LiteralPath $cfg -Destination $tmpCfg -Force
-    }
-    Copy-Item -Path (Join-Path $dist '*') -Destination $dest -Recurse -Force
-    if ($tmpCfg) { Copy-Item -LiteralPath $tmpCfg -Destination $cfg -Force; Remove-Item $tmpCfg -Force -ErrorAction SilentlyContinue }
+    $src = $dist
+    $mode = 'dist'
   } else {
-    throw "dist/ not found in downloaded repo. Ensure the repo contains a dist folder."
+    $src = $root
+    $mode = 'root'
   }
+  Write-Log ("Payload mode: {0}" -f $mode)
+
+  Ensure-Dir $dest
+
+  # Preserve config.json + file.ico unless -Force
+  $cfg = Join-Path $dest 'config.json'
+  $ico = Join-Path $dest 'file.ico'
+  $tmpCfg = $null
+  $tmpIco = $null
+  if ((Test-Path -LiteralPath $cfg) -and (-not $Force)) {
+    $tmpCfg = Join-Path $env:TEMP ("ext4win_cfg_{0}.json" -f ([guid]::NewGuid().ToString('n')))
+    Copy-Item -LiteralPath $cfg -Destination $tmpCfg -Force
+  }
+  if ((Test-Path -LiteralPath $ico) -and (-not $Force)) {
+    $tmpIco = Join-Path $env:TEMP ("ext4win_ico_{0}.ico" -f ([guid]::NewGuid().ToString('n')))
+    Copy-Item -LiteralPath $ico -Destination $tmpIco -Force
+  }
+
+  if ($mode -eq 'dist') {
+    Copy-Item -Path (Join-Path $src '*') -Destination $dest -Recurse -Force
+  } else {
+    # Root payload allowlist (avoid copying .git / workflows etc)
+    $allowFiles = @(
+      'Ext4WinTray.ps1','Ext4WinInstaller.ps1','Ext4WinInstallerStandaloneDeprecated.ps1',
+      'Ext4WinCtl.ps1','Ext4WinCore.ps1','Ext4WinAgent.ps1','Ext4WinLib.psm1','Ext4WinSvc.exe',
+      'file.ico','README.md','README.txt','LICENSE.txt','banner.png','logo.png'
+    )
+    foreach ($f in $allowFiles) {
+      $p = Join-Path $src $f
+      if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination (Join-Path $dest $f) -Force }
+    }
+    foreach ($d in @('docs','icons')) {
+      $dp = Join-Path $src $d
+      if (Test-Path -LiteralPath $dp) { Copy-Item -LiteralPath $dp -Destination (Join-Path $dest $d) -Recurse -Force }
+    }
+  }
+
+  if ($tmpCfg) { Copy-Item -LiteralPath $tmpCfg -Destination $cfg -Force; Remove-Item $tmpCfg -Force -ErrorAction SilentlyContinue }
+  if ($tmpIco) { Copy-Item -LiteralPath $tmpIco -Destination $ico -Force; Remove-Item $tmpIco -Force -ErrorAction SilentlyContinue }
 }
 
 function Write-Config([string]$dest) {
@@ -190,26 +244,29 @@ function Create-Tasks([string]$dest) {
   $ctl = Join-Path $dest 'Ext4WinCtl.ps1'
   $installer = Join-Path $dest 'Ext4WinInstaller.ps1'
 
-  # Wrappers (stdout/stderr always logged)
   Write-RunCmd $dest 'RunTray.cmd' $trayPs1 (Join-Path $dest 'logs\Ext4WinTray.out.log')
-  Write-RunCmd $dest 'RunAgent.cmd' $agentPs1 (Join-Path $dest 'logs\Ext4WinAgent.out.log')
+  if (Test-Path -LiteralPath $agentPs1) {
+    Write-RunCmd $dest 'RunAgent.cmd' $agentPs1 (Join-Path $dest 'logs\Ext4WinAgent.out.log')
+  }
 
-  # Tray (on logon)
+  # Tray: run wrapper to capture logs
   $xmlTray = New-TaskXml 'Ext4Win Tray' 'cmd.exe' ("/c `"$runTray`"") $dest $true $true
   Install-TaskXml 'Ext4Win_Tray' $xmlTray
 
-  # Agent (on logon)
+  # Agent
   if (Test-Path -LiteralPath $agentPs1) {
     $xmlAgent = New-TaskXml 'Ext4Win Agent' 'cmd.exe' ("/c `"$runAgent`"") $dest $true $true
     Install-TaskXml 'Ext4Win_Agent' $xmlAgent
   }
 
-  # MountAll / UnmountAll (on demand)
-  $xmlMount = New-TaskXml 'Ext4Win MountAll' 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"$ctl`" -Action MountAll") $dest $false $true
-  Install-TaskXml 'Ext4Win_MountAll' $xmlMount
+  # Mount / Unmount (on demand)
+  if (Test-Path -LiteralPath $ctl) {
+    $xmlMount = New-TaskXml 'Ext4Win MountAll' 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"$ctl`" -Action MountAll") $dest $false $true
+    Install-TaskXml 'Ext4Win_MountAll' $xmlMount
 
-  $xmlUm = New-TaskXml 'Ext4Win UnmountAll' 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"$ctl`" -Action UnmountAll") $dest $false $true
-  Install-TaskXml 'Ext4Win_UnmountAll' $xmlUm
+    $xmlUm = New-TaskXml 'Ext4Win UnmountAll' 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"$ctl`" -Action UnmountAll") $dest $false $true
+    Install-TaskXml 'Ext4Win_UnmountAll' $xmlUm
+  }
 
   # Update task (on demand)
   $xmlUp = New-TaskXml 'Ext4Win Update' 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"$installer`" -Update") $dest $false $true
@@ -225,7 +282,8 @@ function Create-DesktopShortcut([string]$name, [string]$target, [string]$args) {
     $s.TargetPath = $target
     $s.Arguments = $args
     $s.WorkingDirectory = $InstallDir
-    $s.IconLocation = (Join-Path $InstallDir 'file.ico')
+    $ico = Join-Path $InstallDir 'file.ico'
+    if (Test-Path -LiteralPath $ico) { $s.IconLocation = $ico }
     $s.Save()
   } catch {}
 }
@@ -246,7 +304,7 @@ function Remove-Shortcuts {
   } catch {}
 }
 
-function Do-InstallOrUpdate {
+function Do-DownloadInstallOrUpdate {
   Ensure-Dir $InstallDir
   Ensure-Dir (Join-Path $InstallDir 'logs')
 
@@ -261,7 +319,7 @@ function Do-InstallOrUpdate {
   Copy-Payload $root $InstallDir
   Write-Config $InstallDir
 
-  # Ensure installer self-copy (so Update task works)
+  # Ensure installer self-copy (so Update task works even after update)
   Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $InstallDir 'Ext4WinInstaller.ps1') -Force
 
   Create-Tasks $InstallDir
@@ -277,7 +335,17 @@ function Do-InstallOrUpdate {
   Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
   Write-Log "OK: install/update completato in $InstallDir"
-  Write-Log "Tray log: $InstallDir\logs\Ext4WinTray.out.log"
+  Write-Log "Tray logs:"
+  Write-Log " - $InstallDir\logs\Ext4WinTray.runtime.log"
+  Write-Log " - $InstallDir\logs\Ext4WinTray.out.log"
+}
+
+function Do-RepairTasksOnly {
+  Ensure-Dir $InstallDir
+  Ensure-Dir (Join-Path $InstallDir 'logs')
+  Create-Tasks $InstallDir
+  & schtasks.exe /Run /TN Ext4Win_Tray | Out-Null
+  Write-Log "OK: task riparati."
 }
 
 function Do-Uninstall {
@@ -291,6 +359,7 @@ function Do-Uninstall {
 # Main
 # -----------------------------
 if ($Uninstall) { Do-Uninstall; exit 0 }
-if ($Update) { Do-InstallOrUpdate; exit 0 }
+if ($RepairTasks) { Do-RepairTasksOnly; exit 0 }
+if ($Update) { Do-DownloadInstallOrUpdate; exit 0 }
 
-Do-InstallOrUpdate
+Do-DownloadInstallOrUpdate

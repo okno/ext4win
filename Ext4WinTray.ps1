@@ -1,15 +1,20 @@
 <#
 Ext4WinTray.ps1
-Version: 4.6
-Hotfix: prevent UI hangs + stop process explosions.
+Version: 4.7 (PRODUCTION HOTFIX)
 
-Main changes vs 4.5:
-- FIXED bug: array concatenation in function calls (was passing '+' as an argument) which caused continuous failures and re-launch storms.
-- Added timeouts for external calls (powershell/wsl/schtasks).
-- Added refresh re-entrancy guard.
-- Disk space computed only when opening submenu.
-- Hard safety: if too many WSL-related processes are detected, refresh pauses.
+Fixes for production issues reported:
+- Prevent "ArgumentList is null or empty" failures by blocking empty-args launches (never start interactive powershell/wsl by mistake).
+- Use ONE single Ext4WinCtl call per refresh: -Action Diag (reduces process spawn / WSL sessions).
+- Robust JSON extraction (ignores leading warnings/messages before JSON).
+- Kill process tree on timeout (best-effort) to avoid leaked conhost/wsl children.
+- Add exponential backoff when Ext4WinCtl fails (prevents storms).
+- Add About popup as requested.
 
+About popup text:
+Ext2Win
+Developed with love by Pawel okno Zorzan Urban + GPT5.2pro
+
+Compatible with: Windows PowerShell 5.1, Windows 10/11
 #>
 
 Set-StrictMode -Off
@@ -27,14 +32,18 @@ function Write-TrayLog {
         Add-Content -LiteralPath $RuntimeLog -Value ("{0} [{1}] {2}" -f $ts,$Level,$Message) -Encoding UTF8
     } catch {}
 }
-Write-TrayLog info ("Tray starting (PID={0})." -f $PID)
 
-# Mutex early
+Write-TrayLog info ("Tray starting v4.7 (PID={0})." -f $PID)
+
+# Mutex early (avoid multi-instance storms)
 $mutex=$null
 try {
   $created=$false
   $mutex = New-Object System.Threading.Mutex($true, "Ext4WinTrayMutex", [ref]$created)
-  if (-not $created) { Write-TrayLog warn "Another tray instance is already running; exiting."; exit 0 }
+  if (-not $created) {
+    Write-TrayLog warn "Another tray instance is already running; exiting."
+    exit 0
+  }
 } catch {
   Write-TrayLog warn ("Mutex init failed: {0}" -f $_.Exception.Message)
 }
@@ -57,16 +66,18 @@ $CtlPath = Join-Path $InstallDir 'Ext4WinCtl.ps1'
 $IconPath = Join-Path $InstallDir 'file.ico'
 
 $Strings=@{
- it=@{ title='Ext4Win'; mounted='Montato'; idle='Inattivo'; error='Errore'; mountAll='Monta tutto'; unmountAll='Smonta tutto';
-       partitions='Partizioni ext4'; diskSpace='Spazio disco'; openWsl='Apri cartella WSL'; shutdownWsl='Spegni WSL';
-       agent='Agent'; agentStart='Avvia Agent'; agentStop='Ferma Agent'; agentRestart='Riavvia Agent'; update='Aggiorna Ext4Win';
-       language='Lingua'; langAuto='Auto'; langIt='Italiano'; langEn='English'; exit='Esci'; tip='Ext4Win - Mount ext4 via WSL2';
-       loading='Aggiornamento...'; openToRefresh='Apri per aggiornare'; paused='Refresh in pausa (troppe istanze WSL)' }
- en=@{ title='Ext4Win'; mounted='Mounted'; idle='Idle'; error='Error'; mountAll='Mount all'; unmountAll='Unmount all';
-       partitions='ext4 partitions'; diskSpace='Disk space'; openWsl='Open WSL folder'; shutdownWsl='Shutdown WSL';
-       agent='Agent'; agentStart='Start Agent'; agentStop='Stop Agent'; agentRestart='Restart Agent'; update='Update Ext4Win';
-       language='Language'; langAuto='Auto'; langIt='Italiano'; langEn='English'; exit='Exit'; tip='Ext4Win - Mount ext4 via WSL2';
-       loading='Refreshing...'; openToRefresh='Open to refresh'; paused='Refresh paused (too many WSL instances)' }
+ it=@{ title='Ext4Win'; mounted='Montato'; idle='Inattivo'; error='Errore';
+       mountAll='Monta tutto'; unmountAll='Smonta tutto'; partitions='Partizioni ext4'; diskSpace='Spazio disco';
+       openWsl='Apri cartella WSL'; shutdownWsl='Spegni WSL'; agent='Agent'; agentStart='Avvia Agent'; agentStop='Ferma Agent'; agentRestart='Riavvia Agent';
+       update='Aggiorna Ext4Win'; language='Lingua'; langAuto='Auto'; langIt='Italiano'; langEn='English';
+       about='About'; exit='Esci'; tip='Ext4Win - Mount ext4 via WSL2'; loading='Aggiornamento...'; openToRefresh='Apri per aggiornare';
+       paused='Refresh in pausa (errore Ext4WinCtl)'; wslStorm='Troppe istanze WSL rilevate (paused)' }
+ en=@{ title='Ext4Win'; mounted='Mounted'; idle='Idle'; error='Error';
+       mountAll='Mount all'; unmountAll='Unmount all'; partitions='ext4 partitions'; diskSpace='Disk space';
+       openWsl='Open WSL folder'; shutdownWsl='Shutdown WSL'; agent='Agent'; agentStart='Start Agent'; agentStop='Stop Agent'; agentRestart='Restart Agent';
+       update='Update Ext4Win'; language='Language'; langAuto='Auto'; langIt='Italiano'; langEn='English';
+       about='About'; exit='Exit'; tip='Ext4Win - Mount ext4 via WSL2'; loading='Refreshing...'; openToRefresh='Open to refresh';
+       paused='Refresh paused (Ext4WinCtl error)'; wslStorm='Too many WSL instances detected (paused)' }
 }
 if ($Lang -eq 'auto') {
   try { $ui=[System.Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName.ToLowerInvariant(); if($ui -eq 'it'){$Lang='it'}else{$Lang='en'} } catch { $Lang='en' }
@@ -100,22 +111,68 @@ public static class Native {
 "@ -ErrorAction SilentlyContinue | Out-Null
 } catch {}
 
-# Process helper with timeout
-function Quote-Arg([string]$a){ if($null -eq $a){return '""'}; if($a -match '[\s"]'){ return '"' + ($a -replace '"','\\"') + '"' }; return $a }
+# Helpers
+function Quote-Arg([string]$a){
+  if ($null -eq $a) { return '""' }
+  if ($a -match '[\s"]') { return '"' + ($a -replace '"','\"') + '"' }
+  return $a
+}
+
+function Stop-ProcessTree {
+  param([int]$Pid)
+  try {
+    $children = Get-CimInstance Win32_Process -Filter ("ParentProcessId={0}" -f $Pid) -ErrorAction SilentlyContinue
+    foreach ($c in $children) { Stop-ProcessTree -Pid $c.ProcessId }
+  } catch {}
+  try { Stop-Process -Id $Pid -Force -ErrorAction SilentlyContinue } catch {}
+}
 
 function Invoke-ProcessCapture {
- param([string]$FilePath,[string[]]$Args=@(),[int]$TimeoutMs=1500,[string]$WorkDir=$InstallDir)
- $outFile = Join-Path $env:TEMP ("ext4win_tray_out_{0}.txt" -f ([guid]::NewGuid().ToString('n')))
- $errFile = Join-Path $env:TEMP ("ext4win_tray_err_{0}.txt" -f ([guid]::NewGuid().ToString('n')))
- try{
-   $argLine = ($Args | ForEach-Object { Quote-Arg $_ }) -join ' '
-   $p = Start-Process -FilePath $FilePath -ArgumentList $argLine -WorkingDirectory $WorkDir -WindowStyle Hidden -NoNewWindow -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru
-   if(-not $p.WaitForExit($TimeoutMs)){ try{$p.Kill()}catch{}; return @{ok=$false;timeout=$true;exitcode=124;stdout='';stderr=("timeout {0}ms" -f $TimeoutMs)} }
-   $stdout=''; $stderr=''
-   try{ if(Test-Path -LiteralPath $outFile){ $stdout=Get-Content -Raw -LiteralPath $outFile -ErrorAction SilentlyContinue } }catch{}
-   try{ if(Test-Path -LiteralPath $errFile){ $stderr=Get-Content -Raw -LiteralPath $errFile -ErrorAction SilentlyContinue } }catch{}
-   return @{ok=$true;timeout=$false;exitcode=$p.ExitCode;stdout=$stdout;stderr=$stderr}
- } finally { Remove-Item -LiteralPath $outFile,$errFile -Force -ErrorAction SilentlyContinue }
+  param(
+    [string]$FilePath,
+    [string[]]$Args,
+    [int]$TimeoutMs = 2000,
+    [string]$WorkDir = $InstallDir
+  )
+
+  if ([string]::IsNullOrWhiteSpace($FilePath)) {
+    return @{ ok=$false; timeout=$false; exitcode=127; stdout=''; stderr='FilePath empty' }
+  }
+
+  # IMPORTANT: never start interactive powershell/wsl by mistake.
+  if ($null -eq $Args -or @($Args).Count -eq 0) {
+    return @{ ok=$false; timeout=$false; exitcode=125; stdout=''; stderr='Blocked: empty ArgumentList' }
+  }
+
+  $outFile = Join-Path $env:TEMP ("ext4win_tray_out_{0}.txt" -f ([guid]::NewGuid().ToString('n')))
+  $errFile = Join-Path $env:TEMP ("ext4win_tray_err_{0}.txt" -f ([guid]::NewGuid().ToString('n')))
+
+  try {
+    $argLine = ((@($Args) | ForEach-Object { Quote-Arg $_ }) -join ' ').Trim()
+    if ([string]::IsNullOrWhiteSpace($argLine)) {
+      return @{ ok=$false; timeout=$false; exitcode=125; stdout=''; stderr='Blocked: computed empty ArgumentList' }
+    }
+
+    $p = Start-Process -FilePath $FilePath -ArgumentList $argLine -WorkingDirectory $WorkDir -WindowStyle Hidden -NoNewWindow `
+        -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -ErrorAction Stop
+
+    if (-not $p.WaitForExit($TimeoutMs)) {
+      Stop-ProcessTree -Pid $p.Id
+      return @{ ok=$false; timeout=$true; exitcode=124; stdout=''; stderr=("timeout {0}ms" -f $TimeoutMs) }
+    }
+
+    $stdout=''; $stderr=''
+    try { if (Test-Path -LiteralPath $outFile) { $stdout = Get-Content -Raw -LiteralPath $outFile -ErrorAction SilentlyContinue } } catch {}
+    try { if (Test-Path -LiteralPath $errFile) { $stderr = Get-Content -Raw -LiteralPath $errFile -ErrorAction SilentlyContinue } } catch {}
+
+    return @{ ok=$true; timeout=$false; exitcode=$p.ExitCode; stdout=$stdout; stderr=$stderr }
+  }
+  catch {
+    return @{ ok=$false; timeout=$false; exitcode=126; stdout=''; stderr=$_.Exception.Message }
+  }
+  finally {
+    Remove-Item -LiteralPath $outFile,$errFile -Force -ErrorAction SilentlyContinue
+  }
 }
 
 function Run-Task([string]$Name){ if([string]::IsNullOrWhiteSpace($Name)){return}; try{ & schtasks.exe /Run /TN $Name | Out-Null }catch{} }
@@ -126,44 +183,61 @@ function Get-TaskState([string]$Name){
  $now=Get-Date
  if(($now-$LastAgentCheck).TotalSeconds -lt 15){ return $CacheAgentState }
  try{
-   $r=Invoke-ProcessCapture -FilePath 'schtasks.exe' -Args @('/Query','/TN',$Name,'/FO','LIST','/V') -TimeoutMs 1200
+   $r=Invoke-ProcessCapture -FilePath 'schtasks.exe' -Args @('/Query','/TN',$Name,'/FO','LIST','/V') -TimeoutMs 1500
    $state='Unknown'
    if($r.ok){
-     foreach($ln in ($r.stdout -split "`r?`n")){ if($ln -match '^\s*(Stato|Status)\s*:\s*(.+)\s*$'){ $state=$Matches[2].Trim(); break } }
+     foreach($ln in ($r.stdout -split "`r?`n")){
+       if($ln -match '^\s*(Stato|Status)\s*:\s*(.+)\s*$'){ $state=$Matches[2].Trim(); break }
+     }
    }
    $CacheAgentState=$state; $LastAgentCheck=$now; return $CacheAgentState
  } catch { $CacheAgentState='Unknown'; $LastAgentCheck=$now; return $CacheAgentState }
 }
 
-function Invoke-CtlJson([string[]]$args){
- if(-not (Test-Path -LiteralPath $CtlPath)){ return @() }
- try{
-   $fullArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$CtlPath) + $args
-   $r = Invoke-ProcessCapture -FilePath 'powershell.exe' -Args $fullArgs -TimeoutMs 1800 -WorkDir $InstallDir
-   if(-not $r.ok){ return @() }
-   $txt = ($r.stdout | Out-String).Trim()
-   if([string]::IsNullOrWhiteSpace($txt)){ return @() }
-   return ($txt | ConvertFrom-Json)
- } catch {
-   Write-TrayLog warn ("Ext4WinCtl parse error: {0}" -f $_.Exception.Message)
-   return @()
- }
+function Extract-JsonText([string]$text){
+  if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+  $t = ($text | Out-String).Trim()
+  if ([string]::IsNullOrWhiteSpace($t)) { return $null }
+  $idx = $t.IndexOfAny(@('{','['))
+  if ($idx -lt 0) { return $null }
+  return $t.Substring($idx).Trim()
 }
-function Get-Mounts{ $m=Invoke-CtlJson @('-Action','ListMounts'); if($m -is [string]){return @($m)}; if($m -is [System.Collections.IEnumerable]){return @($m)}; @() }
-function Get-Ext4Parts{ $p=Invoke-CtlJson @('-Action','ListExt4'); if($p -is [System.Collections.IEnumerable]){return @($p)}; @() }
+
+function Invoke-CtlJson([string[]]$args){
+  if (-not (Test-Path -LiteralPath $CtlPath)) { return $null }
+  $fullArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File', $CtlPath) + @($args)
+  $r = Invoke-ProcessCapture -FilePath 'powershell.exe' -Args $fullArgs -TimeoutMs 2500 -WorkDir $InstallDir
+  if (-not $r.ok) {
+    Write-TrayLog warn ("Ext4WinCtl failed (exit={0} timeout={1}): {2}" -f $r.exitcode,$r.timeout,$r.stderr)
+    return $null
+  }
+  $json = Extract-JsonText $r.stdout
+  if ([string]::IsNullOrWhiteSpace($json)) { return $null }
+  try { return ($json | ConvertFrom-Json -ErrorAction Stop) } catch {
+    Write-TrayLog warn ("Ext4WinCtl JSON parse error: {0}" -f $_.Exception.Message)
+    return $null
+  }
+}
+
+function Get-Diag {
+  return (Invoke-CtlJson @('-Action','Diag'))
+}
 
 function Open-WslFolder{ try{ Start-Process explorer.exe ("\\wsl.localhost\{0}\mnt\wsl" -f $Distro) | Out-Null }catch{} }
-function Shutdown-Wsl{ try{ Run-Task $TaskUmount; Start-Sleep 2 }catch{}; try{ & wsl.exe --shutdown | Out-Null }catch{} }
+function Shutdown-Wsl{
+  try { Run-Task $TaskUmount; Start-Sleep 1 } catch {}
+  try { & wsl.exe --shutdown | Out-Null } catch {}
+}
 
 function Human-Bytes([Int64]$b){ $u=@('B','KB','MB','GB','TB','PB'); $v=[double]$b; $i=0; while($v -ge 1024 -and $i -lt ($u.Count-1)){ $v/=1024; $i++ }; ("{0:N1} {1}" -f $v,$u[$i]) }
 function Bar([int]$pct,[int]$len){ if($pct -lt 0){$pct=0}; if($pct -gt 100){$pct=100}; $f=[int][Math]::Round(($pct/100.0)*$len); if($f -gt $len){$f=$len}; ('#'*$f)+('-'*($len-$f)) }
 
 function Get-DiskSpaceLines([string[]]$mounts){
  $lines=@()
- foreach($mp in $mounts){
+ foreach($mp in @($mounts)){
   try{
     $script = "df -B1P `"$mp`" | tail -1"
-    $r = Invoke-ProcessCapture -FilePath 'wsl.exe' -Args @('-d',$Distro,'--exec','sh','-lc',$script) -TimeoutMs 1500
+    $r = Invoke-ProcessCapture -FilePath 'wsl.exe' -Args @('-d',$Distro,'--exec','sh','-lc',$script) -TimeoutMs 2000
     if(-not $r.ok){ continue }
     $row = ($r.stdout | Out-String).Trim()
     if([string]::IsNullOrWhiteSpace($row)){ continue }
@@ -172,7 +246,7 @@ function Get-DiskSpaceLines([string[]]$mounts){
     $avail=[Int64]$parts[3]
     $usep=$parts[4].TrimEnd('%')
     $pct=0; [int]::TryParse($usep,[ref]$pct) | Out-Null
-    $label=$mp; if($mp -match '/mnt/wsl/([^/]+)'){ $Matches[1] | Out-Null; $label=$Matches[1] }
+    $label=$mp; if($mp -match '/mnt/wsl/([^/]+)'){ $label=$Matches[1] }
     $lines += ("{0} [{1}] {2}% | free {3}" -f $label,(Bar $pct 10),$pct,(Human-Bytes $avail))
   } catch {}
  }
@@ -198,12 +272,15 @@ function New-StatusIcon([System.Drawing.Color]$DotColor){
   $ico
  } catch { $BaseIcon }
 }
-$IconIdle=New-StatusIcon ([System.Drawing.Color]::White)
-$IconMounted=New-StatusIcon ([System.Drawing.Color]::Lime)
-$IconError=New-StatusIcon ([System.Drawing.Color]::Red)
+$IconIdle   = New-StatusIcon ([System.Drawing.Color]::White)
+$IconMounted= New-StatusIcon ([System.Drawing.Color]::Lime)
+$IconError  = New-StatusIcon ([System.Drawing.Color]::Red)
 
-function TooManyWslProcesses {
-  try { ((Get-Process -Name 'wsl','wslhost','conhost' -ErrorAction SilentlyContinue | Measure-Object).Count) -gt 200 } catch { $false }
+function TooManyWslInstances {
+  try {
+    $c = (Get-Process -Name 'wsl','wslhost' -ErrorAction SilentlyContinue | Measure-Object).Count
+    return ($c -gt 30)
+  } catch { return $false }
 }
 
 # UI
@@ -269,7 +346,7 @@ try{
  $miLangEn=New-Object System.Windows.Forms.ToolStripMenuItem (T 'langEn')
 
  function Restart-Tray{
-  try{ Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell1.0\powershell.exe" -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-STA','-WindowStyle','Hidden','-File',$PSCommandPath) -WorkingDirectory $InstallDir -WindowStyle Hidden | Out-Null }catch{}
+  try{ Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-STA','-WindowStyle','Hidden','-File', $PSCommandPath) -WorkingDirectory $InstallDir -WindowStyle Hidden | Out-Null }catch{}
   try{ [System.Windows.Forms.Application]::Exit() }catch{}
  }
  $miLangAuto.Add_Click({ Save-Language 'auto'; Restart-Tray }) | Out-Null
@@ -279,6 +356,14 @@ try{
  [void]$miLang.DropDownItems.Add($miLangIt)
  [void]$miLang.DropDownItems.Add($miLangEn)
  [void]$menu.Items.Add($miLang)
+
+ $miAbout=New-Object System.Windows.Forms.ToolStripMenuItem (T 'about')
+ $miAbout.Add_Click({
+   try {
+     [System.Windows.Forms.MessageBox]::Show("Ext2Win`nDeveloped with love by Pawel okno Zorzan Urban + GPT5.2pro","About", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+   } catch {}
+ }) | Out-Null
+ [void]$menu.Items.Add($miAbout)
 
  [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
@@ -290,14 +375,19 @@ try{
  }) | Out-Null
  [void]$menu.Items.Add($miExit)
 
+ # Cached state
  $CacheMounts=@(); $CacheParts=@(); $CacheErr=$false
  $RefreshInProgress=$false
+ $CtlFailCount=0
+ $NextAllowed = Get-Date '2000-01-01'
 
  function Populate-PartsFromCache{
   try{
    $miParts.DropDownItems.Clear()
-   if(@($CacheParts).Count -eq 0){ $it=New-Object System.Windows.Forms.ToolStripMenuItem '-'; $it.Enabled=$false; [void]$miParts.DropDownItems.Add($it); return }
-   foreach($p in $CacheParts){
+   if(@($CacheParts).Count -eq 0){
+     $it=New-Object System.Windows.Forms.ToolStripMenuItem '-'; $it.Enabled=$false; [void]$miParts.DropDownItems.Add($it); return
+   }
+   foreach($p in @($CacheParts)){
      $name=("Disk {0} / Part {1}" -f $p.DiskNumber,$p.PartitionNumber)
      if($p.DiskFriendlyName){ $name=("{0} (Disk {1} Part {2})" -f $p.DiskFriendlyName,$p.DiskNumber,$p.PartitionNumber) }
      $it=New-Object System.Windows.Forms.ToolStripMenuItem $name; $it.Enabled=$false; [void]$miParts.DropDownItems.Add($it)
@@ -311,39 +401,87 @@ try{
     $ph=New-Object System.Windows.Forms.ToolStripMenuItem (T 'loading'); $ph.Enabled=$false; [void]$miSpace.DropDownItems.Add($ph)
     $lines = Get-DiskSpaceLines -mounts @($CacheMounts)
     $miSpace.DropDownItems.Clear()
-    if(@($lines).Count -eq 0){ $it=New-Object System.Windows.Forms.ToolStripMenuItem '-'; $it.Enabled=$false; [void]$miSpace.DropDownItems.Add($it) }
-    else { foreach($ln in $lines){ $it=New-Object System.Windows.Forms.ToolStripMenuItem $ln; $it.Enabled=$false; [void]$miSpace.DropDownItems.Add($it) } }
+    if(@($lines).Count -eq 0){
+      $it=New-Object System.Windows.Forms.ToolStripMenuItem '-'; $it.Enabled=$false; [void]$miSpace.DropDownItems.Add($it)
+    } else {
+      foreach($ln in $lines){ $it=New-Object System.Windows.Forms.ToolStripMenuItem $ln; $it.Enabled=$false; [void]$miSpace.DropDownItems.Add($it) }
+    }
   }catch{}
  }
 
  $miParts.Add_DropDownOpening({ Populate-PartsFromCache }) | Out-Null
  $miSpace.Add_DropDownOpening({ Populate-SpaceLazy }) | Out-Null
 
+ function Set-ErrorState([string]$msg){
+   $CacheErr=$true
+   $statusItem.Text = $msg
+   $notify.Icon = $IconError
+   $notify.Text = (T 'error')
+ }
+
  function Refresh-State{
   if($RefreshInProgress){ return }
   $RefreshInProgress=$true
   try{
-    if(TooManyWslProcesses){
-      $CacheErr=$true
-      $statusItem.Text=(T 'paused')
-      $notify.Icon=$IconError
+    $now = Get-Date
+    if ($now -lt $NextAllowed) { return }
+
+    if (TooManyWslInstances) {
+      Set-ErrorState (T 'wslStorm')
+      # backoff
+      $NextAllowed = (Get-Date).AddSeconds(30)
       return
     }
-    $CacheMounts=@(Get-Mounts)
-    $CacheParts=@(Get-Ext4Parts)
-    $agentState=Get-TaskState $TaskAgent
-    $statusItem.Text=("{0} | Agent: {1} | ext4: {2} | mounts: {3}" -f (T 'title'),$agentState,@($CacheParts).Count,@($CacheMounts).Count)
-    if(@($CacheMounts).Count -gt 0){ $notify.Icon=$IconMounted } else { $notify.Icon=$IconIdle }
+
+    $diag = Get-Diag
+    if ($null -eq $diag) {
+      $CtlFailCount++
+      Set-ErrorState (T 'paused')
+      # exponential backoff: 5s,10s,20s,40s,60s max
+      $delay = [Math]::Min(60, [Math]::Pow(2, [Math]::Min(4, $CtlFailCount)) * 5)
+      $NextAllowed = (Get-Date).AddSeconds($delay)
+      return
+    }
+
+    $CtlFailCount = 0
+    $NextAllowed = (Get-Date).AddSeconds(0)
+
+    $mounts=@()
+    try {
+      if ($null -ne $diag.mounts) {
+        if ($diag.mounts -is [string]) { $mounts=@($diag.mounts) } else { $mounts=@($diag.mounts) }
+      }
+    } catch {}
+    $parts=@()
+    try {
+      if ($null -ne $diag.ext4) { $parts=@($diag.ext4) }
+    } catch {}
+
+    $CacheMounts=@($mounts)
+    $CacheParts=@($parts)
+    $CacheErr=$false
+
+    $agentState = Get-TaskState $TaskAgent
+    $mCount=@($CacheMounts).Count
+    $pCount=@($CacheParts).Count
+    $statusItem.Text = ("{0} | Agent: {1} | ext4: {2} | mounts: {3}" -f (T 'title'),$agentState,$pCount,$mCount)
+
+    if ($mCount -gt 0) { $notify.Icon=$IconMounted; $notify.Text=(T 'mounted') }
+    else { $notify.Icon=$IconIdle; $notify.Text=(T 'idle') }
+
     Populate-PartsFromCache
+
+    # space is lazy
     $miSpace.DropDownItems.Clear()
     $it=New-Object System.Windows.Forms.ToolStripMenuItem (T 'openToRefresh'); $it.Enabled=$false; [void]$miSpace.DropDownItems.Add($it)
-  } finally { $RefreshInProgress=$false }
+  }
+  finally { $RefreshInProgress=$false }
  }
 
  $menu.Add_Opening({ Refresh-State }) | Out-Null
 
  $timer=New-Object System.Windows.Forms.Timer
- $timer.Interval=5000
+ $timer.Interval=10000
  $timer.Add_Tick({ Refresh-State }) | Out-Null
  $timer.Start()
 
